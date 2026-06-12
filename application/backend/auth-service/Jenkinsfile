@@ -1,27 +1,32 @@
-// Auth service deploy pipeline — build Docker image, push to ECR, roll out to EKS
-//
-// Jenkins agent needs: Docker, AWS CLI, kubectl
-// AWS credential in Jenkins (e.g. aws-frontend-terraform):
-//   ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload
-//   eks:DescribeCluster (for update-kubeconfig)
-// EKS access: IAM principal must be in infrastructure/backend terraform.tfvars
-//   cluster_admin_principal_arns (see backend README — kubectl access)
+// Auth service deploy pipeline: build Docker image, push to ECR, roll out to EKS.
+// Cluster, registry, namespace, and image tag are supplied by Jenkins parameters.
 
 pipeline {
     agent {
         label 'terraform'
     }
-    
-    environment {
-        EKS_CLUSTER = 'cdec-eks-dev'
-        EKS_REGION = 'eu-west-1'
+
+    parameters {
+        string(name: 'GIT_URL', defaultValue: 'https://github.com/atulyw/cdec-alpha-app.git', description: 'Repository URL to checkout.')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Git branch to deploy.')
+        string(name: 'AWS_CREDENTIALS_ID', defaultValue: 'aws-frontend-terraform', description: 'Jenkins AWS credentials ID.')
+
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '933516006319', description: 'AWS account ID that owns the ECR repositories.')
+        string(name: 'ECR_REGION', defaultValue: 'eu-west-1', description: 'AWS region for ECR.')
+        string(name: 'ECR_REPOSITORY', defaultValue: 'backend/auth-service', description: 'ECR repository name/path.')
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Docker image tag to build and deploy.')
+
+        string(name: 'EKS_CLUSTER', defaultValue: 'cdec-eks-dev', description: 'Target EKS cluster name.')
+        string(name: 'EKS_REGION', defaultValue: 'eu-west-1', description: 'Target EKS cluster region.')
+        string(name: 'K8S_NAMESPACE', defaultValue: 'default', description: 'Kubernetes namespace to deploy into.')
+        password(name: 'MONGO_URI', defaultValue: '', description: 'Optional MongoDB URI to inject into the deployment.')
+        password(name: 'JWT_SECRET', defaultValue: '', description: 'Optional JWT secret to inject into the deployment.')
     }
 
     stages {
-
         stage('Checkout') {
             steps {
-                git url: 'https://github.com/atulyw/cdec-alpha-app.git', branch: 'main'
+                git url: params.GIT_URL, branch: params.GIT_BRANCH
             }
         }
 
@@ -31,9 +36,9 @@ pipeline {
             }
             steps {
                 dir('application/backend/auth-service') {
-                    sh '''
-                        docker build -t 933516006319.dkr.ecr.eu-west-1.amazonaws.com/backend/auth-service:latest .
-                    '''
+                    sh """
+                        docker build -t ${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG} .
+                    """
                 }
             }
         }
@@ -45,16 +50,15 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
-                    sh '''
-                        export AWS_DEFAULT_REGION=eu-west-1
-                        aws ecr get-login-password --region eu-west-1 | \
-                            docker login --username AWS --password-stdin 933516006319.dkr.ecr.eu-west-1.amazonaws.com
-                        docker push 933516006319.dkr.ecr.eu-west-1.amazonaws.com/backend/auth-service:latest
-                    '''
+                    sh """
+                        aws ecr get-login-password --region ${params.ECR_REGION} | \
+                            docker login --username AWS --password-stdin ${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com
+                        docker push ${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG}
+                    """
                 }
             }
         }
@@ -63,19 +67,25 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir('application/backend/auth-service') {
-                        sh '''
-                            export AWS_DEFAULT_REGION=${EKS_REGION}
-                            aws eks update-kubeconfig --region ${EKS_REGION} --name ${EKS_CLUSTER}
+                        sh """
+                            aws eks update-kubeconfig --region ${params.EKS_REGION} --name ${params.EKS_CLUSTER}
+                            kubectl get namespace ${params.K8S_NAMESPACE} || kubectl create namespace ${params.K8S_NAMESPACE}
 
-                            kubectl apply -f k8s/deployment.yml -n default
-                            kubectl rollout restart deployment/auth-service -n default
-                            kubectl rollout status deployment/auth-service -n default --timeout=300s
-                        '''
+                            kubectl apply -f k8s/deployment.yml -n ${params.K8S_NAMESPACE}
+                            kubectl set image deployment/auth-service auth-service=${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG} -n ${params.K8S_NAMESPACE}
+                            if [ -n "\$MONGO_URI" ]; then
+                                kubectl set env deployment/auth-service MONGO_URI="\$MONGO_URI" -n ${params.K8S_NAMESPACE}
+                            fi
+                            if [ -n "\$JWT_SECRET" ]; then
+                                kubectl set env deployment/auth-service JWT_SECRET="\$JWT_SECRET" -n ${params.K8S_NAMESPACE}
+                            fi
+                            kubectl rollout status deployment/auth-service -n ${params.K8S_NAMESPACE} --timeout=300s
+                        """
                     }
                 }
             }
@@ -84,7 +94,7 @@ pipeline {
 
     post {
         success {
-            echo 'auth-service deployed successfully!'
+            echo 'auth-service deployed successfully.'
         }
         failure {
             echo 'auth-service deployment failed. Check the stage logs above.'

@@ -1,21 +1,82 @@
-// Frontend Terraform pipeline
-// Requires: terraform, aws-frontend-terraform credentials, terraform.tfvars and backend.hcl in TF_DIR
+import groovy.json.JsonOutput
+
+def csvList(String value) {
+    return value?.trim() ? value.split(/\s*,\s*/).findAll { it } : []
+}
+
+// Frontend Terraform pipeline (S3 + CloudFront + Route 53).
+// Runtime-specific values are supplied by Jenkins parameters, not committed tfvars edits.
 
 pipeline {
     agent {
         label 'terraform'
     }
 
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['create', 'delete'],
+            description: 'create provisions/updates frontend infra. delete destroys frontend infra for the same parameter set.'
+        )
+
+        string(name: 'AWS_CREDENTIALS_ID', defaultValue: 'aws-frontend-terraform', description: 'Jenkins AWS credentials ID.')
+        string(name: 'AWS_REGION', defaultValue: 'eu-west-1', description: 'AWS region for S3 and regional resources.')
+
+        string(name: 'TF_STATE_BUCKET', defaultValue: 'cdec-alpha-terraform-state-atulyw', description: 'S3 bucket for Terraform remote state.')
+        string(name: 'TF_STATE_KEY', defaultValue: 'frontend/terraform.tfstate', description: 'S3 key for this frontend stack state.')
+        string(name: 'TF_STATE_REGION', defaultValue: 'eu-west-1', description: 'AWS region of the Terraform state bucket.')
+
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Environment label used in tags and naming.')
+        string(name: 'APPLICATION', defaultValue: 'cdec-alpha', description: 'Application identifier used in names and tags.')
+        string(name: 'BUCKET_NAME', defaultValue: '', description: 'Globally unique S3 bucket name. Leave blank to use Terraform default naming.')
+        booleanParam(name: 'FORCE_DESTROY', defaultValue: false, description: 'Allow Terraform to delete the frontend bucket when it contains objects.')
+        booleanParam(name: 'ENABLE_VERSIONING', defaultValue: false, description: 'Enable S3 versioning on the frontend bucket.')
+        booleanParam(name: 'ENABLE_SPA_ROUTING', defaultValue: true, description: 'Serve index.html for SPA 403/404 responses.')
+
+        text(name: 'CLOUDFRONT_ALIASES', defaultValue: '', description: 'Comma-separated custom domains. Leave blank to derive from DNS_RECORD_NAME.')
+        string(name: 'CLOUDFRONT_ACM_CERTIFICATE_ARN', defaultValue: 'arn:aws:acm:us-east-1:933516006319:certificate/fd6dd327-9040-4390-b756-672c18a25ff3', description: 'ACM cert ARN in us-east-1 for CloudFront aliases.')
+
+        string(name: 'DNS_ZONE_NAME', defaultValue: 'thecloudnine.in', description: 'Route 53 zone name to create/use when ROUTE53_ZONE_ID is blank.')
+        string(name: 'ROUTE53_ZONE_ID', defaultValue: '', description: 'Existing hosted zone ID. Leave blank to create/manage by zone name.')
+        booleanParam(name: 'DNS_ZONE_FORCE_DESTROY', defaultValue: false, description: 'Allow Terraform to delete the hosted zone when it contains records.')
+        string(name: 'DNS_RECORD_NAME', defaultValue: 'www.thecloudnine.in', description: 'FQDN alias record for CloudFront. Leave blank to skip DNS records.')
+    }
+
     environment {
         TF_DIR = 'infrastructure/frontend'
-        AWS_DEFAULT_REGION = 'eu-west-1'
+        TF_VARS_FILE = 'zz-jenkins.auto.tfvars.json'
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 git url: 'https://github.com/atulyw/cdec-alpha-app.git', branch: 'main'
+            }
+        }
+
+        stage('Write Terraform Variables') {
+            steps {
+                script {
+                    def tfvars = [
+                        aws_region: params.AWS_REGION,
+                        environment: params.ENVIRONMENT,
+                        application: params.APPLICATION,
+                        bucket_name: params.BUCKET_NAME?.trim() ? params.BUCKET_NAME.trim() : null,
+                        force_destroy: params.FORCE_DESTROY,
+                        enable_versioning: params.ENABLE_VERSIONING,
+                        enable_spa_routing: params.ENABLE_SPA_ROUTING,
+                        cloudfront_aliases: csvList(params.CLOUDFRONT_ALIASES),
+                        acm_certificate_arn: params.CLOUDFRONT_ACM_CERTIFICATE_ARN?.trim() ? params.CLOUDFRONT_ACM_CERTIFICATE_ARN.trim() : null,
+                        dns_zone_name: params.DNS_ZONE_NAME,
+                        route53_zone_id: params.ROUTE53_ZONE_ID?.trim() ? params.ROUTE53_ZONE_ID.trim() : null,
+                        dns_zone_force_destroy: params.DNS_ZONE_FORCE_DESTROY,
+                        dns_record_name: params.DNS_RECORD_NAME
+                    ]
+
+                    dir(env.TF_DIR) {
+                        writeFile file: env.TF_VARS_FILE, text: JsonOutput.prettyPrint(JsonOutput.toJson(tfvars))
+                    }
+                }
             }
         }
 
@@ -23,12 +84,17 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform init -input=false'
+                        sh """
+                            terraform init -input=false -reconfigure \
+                                -backend-config="bucket=${params.TF_STATE_BUCKET}" \
+                                -backend-config="key=${params.TF_STATE_KEY}" \
+                                -backend-config="region=${params.TF_STATE_REGION}"
+                        """
                     }
                 }
             }
@@ -43,33 +109,84 @@ pipeline {
         }
 
         stage('Terraform Plan') {
+            when {
+                expression { params.ACTION == 'create' }
+            }
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform plan -input=false -var-file=terraform.tfvars'
+                        sh 'terraform plan -input=false'
                     }
                 }
             }
         }
 
         stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'create' }
+            }
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform apply -input=false -auto-approve -var-file=terraform.tfvars'
+                        sh 'terraform apply -input=false -auto-approve'
                     }
                 }
             }
+        }
+
+        stage('Terraform Plan Destroy') {
+            when {
+                expression { params.ACTION == 'delete' }
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir(env.TF_DIR) {
+                        sh 'terraform plan -destroy -input=false'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'delete' }
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir(env.TF_DIR) {
+                        sh 'terraform destroy -input=false -auto-approve'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Frontend infrastructure ${params.ACTION == 'create' ? 'created/updated' : 'destroyed'} successfully."
+        }
+        failure {
+            echo "Frontend infrastructure ${params.ACTION} failed. Check the stage logs above."
         }
     }
 }

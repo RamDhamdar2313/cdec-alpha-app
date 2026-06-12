@@ -1,5 +1,16 @@
-// Backend Terraform pipeline (VPC + EKS)
-// Requires: terraform, aws-frontend-terraform credentials, terraform.tfvars and backend.hcl in TF_DIR
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def csvList(String value) {
+    return value?.trim() ? value.split(/\s*,\s*/).findAll { it } : []
+}
+
+def jsonMap(String value) {
+    return value?.trim() ? new JsonSlurperClassic().parseText(value) : [:]
+}
+
+// Backend Terraform pipeline (VPC + EKS + optional ALB ingress).
+// Runtime-specific values are supplied by Jenkins parameters, not committed tfvars edits.
 
 pipeline {
     agent {
@@ -10,20 +21,103 @@ pipeline {
         choice(
             name: 'ACTION',
             choices: ['create', 'delete'],
-            description: 'create: terraform plan + apply (provision VPC + EKS). delete: terraform plan -destroy + destroy (tear down all backend infra).'
+            description: 'create provisions/updates backend infra. delete destroys backend infra for the same parameter set.'
         )
+
+        string(name: 'AWS_CREDENTIALS_ID', defaultValue: 'aws-frontend-terraform', description: 'Jenkins AWS credentials ID.')
+        string(name: 'AWS_REGION', defaultValue: 'eu-west-1', description: 'AWS region for VPC, EKS, and ALB.')
+
+        string(name: 'TF_STATE_BUCKET', defaultValue: 'cdec-alpha-terraform-state-atulyw', description: 'S3 bucket for Terraform remote state.')
+        string(name: 'TF_STATE_KEY', defaultValue: 'backend/terraform.tfstate', description: 'S3 key for this backend stack state.')
+        string(name: 'TF_STATE_REGION', defaultValue: 'eu-west-1', description: 'AWS region of the Terraform state bucket.')
+
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Environment label used in tags and naming.')
+        string(name: 'PROJECT_NAME', defaultValue: 'cdec-alpha', description: 'Project name used in resource names and tags.')
+        string(name: 'CLUSTER_NAME', defaultValue: 'cdec-eks-dev', description: 'EKS cluster name.')
+
+        string(name: 'VPC_CIDR', defaultValue: '10.0.0.0/16', description: 'VPC CIDR block.')
+        text(name: 'PUBLIC_SUBNET_CIDRS', defaultValue: '10.0.1.0/24,10.0.2.0/24', description: 'Comma-separated public subnet CIDRs.')
+        text(name: 'PRIVATE_SUBNET_CIDRS', defaultValue: '10.0.10.0/24,10.0.20.0/24', description: 'Comma-separated private subnet CIDRs.')
+        text(name: 'AVAILABILITY_ZONES', defaultValue: 'eu-west-1a,eu-west-1b', description: 'Comma-separated availability zones.')
+        booleanParam(name: 'SINGLE_NAT_GATEWAY', defaultValue: true, description: 'Use one NAT gateway for all private subnets.')
+
+        string(name: 'KUBERNETES_VERSION', defaultValue: '1.34', description: 'EKS Kubernetes version. Leave blank to use Terraform default/null.')
+        text(name: 'NODE_INSTANCE_TYPES', defaultValue: 'c7i-flex.large', description: 'Comma-separated EC2 instance types for worker nodes.')
+        string(name: 'DESIRED_SIZE', defaultValue: '2', description: 'Desired worker node count.')
+        string(name: 'MIN_SIZE', defaultValue: '1', description: 'Minimum worker node count.')
+        string(name: 'MAX_SIZE', defaultValue: '3', description: 'Maximum worker node count.')
+        string(name: 'DISK_SIZE', defaultValue: '50', description: 'Node root volume size in GiB.')
+
+        booleanParam(name: 'CLUSTER_ENDPOINT_PUBLIC_ACCESS', defaultValue: true, description: 'Enable public Kubernetes API endpoint.')
+        booleanParam(name: 'CLUSTER_ENDPOINT_PRIVATE_ACCESS', defaultValue: true, description: 'Enable private Kubernetes API endpoint.')
+        text(name: 'CLUSTER_ENDPOINT_PUBLIC_ACCESS_CIDRS', defaultValue: '0.0.0.0/0', description: 'Comma-separated CIDRs allowed to access the public API endpoint.')
+        booleanParam(name: 'ENABLE_CLUSTER_AUTOSCALER_TAGS', defaultValue: true, description: 'Tag node group for Cluster Autoscaler discovery.')
+        text(name: 'CLUSTER_ADMIN_PRINCIPAL_ARNS', defaultValue: '', description: 'Comma-separated IAM principal ARNs for kubectl admin access.')
+        text(name: 'CLUSTER_ADMIN_IAM_ROLE_NAMES', defaultValue: '', description: 'Comma-separated IAM role names for kubectl admin access.')
+        booleanParam(name: 'INCLUDE_CALLER_AS_CLUSTER_ADMIN', defaultValue: true, description: 'Grant admin to the IAM principal running Terraform.')
+
+        booleanParam(name: 'ENABLE_ALB_INGRESS', defaultValue: true, description: 'Install AWS Load Balancer Controller and API ingress.')
+        string(name: 'INGRESS_HOST', defaultValue: 'api.thecloudnine.in', description: 'Backend API hostname, for example api.example.com.')
+        string(name: 'ALB_ACM_CERTIFICATE_ARN', defaultValue: 'arn:aws:acm:eu-west-1:933516006319:certificate/dab4d476-ddf2-40ef-ae09-0d3ced0e76e1', description: 'ACM cert ARN in the EKS region for ALB HTTPS.')
+        string(name: 'ALB_NAME', defaultValue: 'cdec-alpha-alb', description: 'Fixed name for the internet-facing ALB.')
+        text(name: 'ALB_ALLOWED_INBOUND_CIDRS', defaultValue: '0.0.0.0/0', description: 'Comma-separated CIDRs allowed to reach ALB ports 80/443.')
+
+        text(name: 'ADDITIONAL_TAGS_JSON', defaultValue: '{"Owner":"platform-team"}', description: 'Additional AWS tags as a JSON object.')
     }
 
     environment {
         TF_DIR = 'infrastructure/backend'
-        AWS_DEFAULT_REGION = 'eu-west-1'
+        TF_VARS_FILE = 'zz-jenkins.auto.tfvars.json'
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 git url: 'https://github.com/atulyw/cdec-alpha-app.git', branch: 'main'
+            }
+        }
+
+        stage('Write Terraform Variables') {
+            steps {
+                script {
+                    def tfvars = [
+                        aws_region: params.AWS_REGION,
+                        environment: params.ENVIRONMENT,
+                        project_name: params.PROJECT_NAME,
+                        cluster_name: params.CLUSTER_NAME,
+                        additional_tags: jsonMap(params.ADDITIONAL_TAGS_JSON),
+
+                        vpc_cidr: params.VPC_CIDR,
+                        public_subnet_cidrs: csvList(params.PUBLIC_SUBNET_CIDRS),
+                        private_subnet_cidrs: csvList(params.PRIVATE_SUBNET_CIDRS),
+                        availability_zones: csvList(params.AVAILABILITY_ZONES),
+                        single_nat_gateway: params.SINGLE_NAT_GATEWAY,
+
+                        kubernetes_version: params.KUBERNETES_VERSION?.trim() ? params.KUBERNETES_VERSION.trim() : null,
+                        node_instance_types: csvList(params.NODE_INSTANCE_TYPES),
+                        desired_size: params.DESIRED_SIZE as Integer,
+                        min_size: params.MIN_SIZE as Integer,
+                        max_size: params.MAX_SIZE as Integer,
+                        disk_size: params.DISK_SIZE as Integer,
+                        cluster_endpoint_public_access: params.CLUSTER_ENDPOINT_PUBLIC_ACCESS,
+                        cluster_endpoint_private_access: params.CLUSTER_ENDPOINT_PRIVATE_ACCESS,
+                        cluster_endpoint_public_access_cidrs: csvList(params.CLUSTER_ENDPOINT_PUBLIC_ACCESS_CIDRS),
+                        enable_cluster_autoscaler_tags: params.ENABLE_CLUSTER_AUTOSCALER_TAGS,
+                        cluster_admin_principal_arns: csvList(params.CLUSTER_ADMIN_PRINCIPAL_ARNS),
+                        cluster_admin_iam_role_names: csvList(params.CLUSTER_ADMIN_IAM_ROLE_NAMES),
+                        include_caller_as_cluster_admin: params.INCLUDE_CALLER_AS_CLUSTER_ADMIN,
+
+                        enable_alb_ingress: params.ENABLE_ALB_INGRESS,
+                        ingress_host: params.INGRESS_HOST,
+                        acm_certificate_arn: params.ALB_ACM_CERTIFICATE_ARN,
+                        alb_name: params.ALB_NAME,
+                        alb_allowed_inbound_cidrs: csvList(params.ALB_ALLOWED_INBOUND_CIDRS)
+                    ]
+
+                    dir(env.TF_DIR) {
+                        writeFile file: env.TF_VARS_FILE, text: JsonOutput.prettyPrint(JsonOutput.toJson(tfvars))
+                    }
+                }
             }
         }
 
@@ -31,12 +125,17 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform init -input=false'
+                        sh """
+                            terraform init -input=false -reconfigure \
+                                -backend-config="bucket=${params.TF_STATE_BUCKET}" \
+                                -backend-config="key=${params.TF_STATE_KEY}" \
+                                -backend-config="region=${params.TF_STATE_REGION}"
+                        """
                     }
                 }
             }
@@ -57,12 +156,12 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform plan -input=false -var-file=terraform.tfvars'
+                        sh 'terraform plan -input=false'
                     }
                 }
             }
@@ -75,12 +174,12 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform apply -input=false -auto-approve -var-file=terraform.tfvars'
+                        sh 'terraform apply -input=false -auto-approve'
                     }
                 }
             }
@@ -93,12 +192,12 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform plan -destroy -input=false -var-file=terraform.tfvars'
+                        sh 'terraform plan -destroy -input=false'
                     }
                 }
             }
@@ -111,12 +210,12 @@ pipeline {
             steps {
                 withCredentials([[
                     $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'aws-frontend-terraform',
+                    credentialsId: params.AWS_CREDENTIALS_ID,
                     accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir(env.TF_DIR) {
-                        sh 'terraform destroy -input=false -auto-approve -var-file=terraform.tfvars'
+                        sh 'terraform destroy -input=false -auto-approve'
                     }
                 }
             }
@@ -125,22 +224,10 @@ pipeline {
 
     post {
         success {
-            script {
-                if (params.ACTION == 'create') {
-                    echo 'Backend infrastructure created successfully!'
-                } else {
-                    echo 'Backend infrastructure destroyed successfully!'
-                }
-            }
+            echo "Backend infrastructure ${params.ACTION == 'create' ? 'created/updated' : 'destroyed'} successfully."
         }
         failure {
-            script {
-                if (params.ACTION == 'create') {
-                    echo 'Backend infrastructure create failed. Check the stage logs above.'
-                } else {
-                    echo 'Backend infrastructure destroy failed. Check the stage logs above.'
-                }
-            }
+            echo "Backend infrastructure ${params.ACTION} failed. Check the stage logs above."
         }
     }
 }
