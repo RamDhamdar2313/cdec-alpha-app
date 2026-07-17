@@ -37,6 +37,15 @@ pipeline {
             steps {
                 dir('application/backend/auth-service') {
                     sh """
+                        echo "===== DEBUG ====="
+                        whoami
+                        id
+                        hostname
+                        pwd
+                        groups
+                        which docker
+                        docker --version
+                        docker ps
                         docker build -t ${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG} .
                     """
                 }
