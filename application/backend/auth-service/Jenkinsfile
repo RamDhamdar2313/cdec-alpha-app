@@ -19,7 +19,7 @@ pipeline {
         string(name: 'EKS_CLUSTER', defaultValue: 'cdec-eks-dev', description: 'Target EKS cluster name.')
         string(name: 'EKS_REGION', defaultValue: 'eu-west-1', description: 'Target EKS cluster region.')
         string(name: 'K8S_NAMESPACE', defaultValue: 'default', description: 'Kubernetes namespace to deploy into.')
-        password(name: 'MONGO_URI', defaultValue: '', description: 'Optional MongoDB URI to inject into the deployment.')
+        password(name: 'MONGO_URI', defaultValue: '', description: 'MongoDB URI or base URI. If no database/query is provided, /cb_auth?retryWrites=true&w=majority&appName=cdec-dev will be appended.')
         password(name: 'JWT_SECRET', defaultValue: '', description: 'Optional JWT secret to inject into the deployment.')
     }
 
@@ -72,21 +72,27 @@ pipeline {
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     dir('application/backend/auth-service') {
-                        withEnv(["MONGO_URI=${params.MONGO_URI}", "JWT_SECRET=${params.JWT_SECRET}"]) {
-                            sh """
-                                aws eks update-kubeconfig --region ${params.EKS_REGION} --name ${params.EKS_CLUSTER}
-                                kubectl get namespace ${params.K8S_NAMESPACE} || kubectl create namespace ${params.K8S_NAMESPACE}
+                        script {
+                            def mongoUri = params.MONGO_URI?.trim()
+                            if (mongoUri && !mongoUri.contains('?')) {
+                                mongoUri += '/cb_auth?retryWrites=true&w=majority&appName=cdec-dev'
+                            }
+                            withEnv(["MONGO_URI=${mongoUri}", "JWT_SECRET=${params.JWT_SECRET}"]) {
+                                sh """
+                                    aws eks update-kubeconfig --region ${params.EKS_REGION} --name ${params.EKS_CLUSTER}
+                                    kubectl get namespace ${params.K8S_NAMESPACE} || kubectl create namespace ${params.K8S_NAMESPACE}
 
-                                kubectl apply -f k8s/deployment.yml -n ${params.K8S_NAMESPACE}
-                                kubectl set image deployment/auth-service auth-service=${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG} -n ${params.K8S_NAMESPACE}
-                                if [ -n "\$MONGO_URI" ]; then
-                                    kubectl set env deployment/auth-service MONGO_URI="\$MONGO_URI" -n ${params.K8S_NAMESPACE}
-                                fi
-                                if [ -n "\$JWT_SECRET" ]; then
-                                    kubectl set env deployment/auth-service JWT_SECRET="\$JWT_SECRET" -n ${params.K8S_NAMESPACE}
-                                fi
-                                kubectl rollout status deployment/auth-service -n ${params.K8S_NAMESPACE} --timeout=300s
-                            """
+                                    kubectl apply -f k8s/deployment.yml -n ${params.K8S_NAMESPACE}
+                                    kubectl set image deployment/auth-service auth-service=${params.AWS_ACCOUNT_ID}.dkr.ecr.${params.ECR_REGION}.amazonaws.com/${params.ECR_REPOSITORY}:${params.IMAGE_TAG} -n ${params.K8S_NAMESPACE}
+                                    if [ -n "\$MONGO_URI" ]; then
+                                        kubectl set env deployment/auth-service MONGO_URI="\$MONGO_URI" -n ${params.K8S_NAMESPACE}
+                                    fi
+                                    if [ -n "\$JWT_SECRET" ]; then
+                                        kubectl set env deployment/auth-service JWT_SECRET="\$JWT_SECRET" -n ${params.K8S_NAMESPACE}
+                                    fi
+                                    kubectl rollout status deployment/auth-service -n ${params.K8S_NAMESPACE} --timeout=300s
+                                """
+                            }
                         }
                     }
                 }
