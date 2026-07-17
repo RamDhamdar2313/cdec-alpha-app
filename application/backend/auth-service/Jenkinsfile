@@ -82,7 +82,7 @@ pipeline {
                 ]]) {
                     dir('application/backend/auth-service') {
                         script {
-                            def mongoUri = params.MONGO_URI?.trim()
+                            def mongoUri = params.MONGO_URI?.getPlainText()?.trim()
                             if (mongoUri && !mongoUri.contains('?')) {
                                 mongoUri += '/cb_auth?retryWrites=true&w=majority&appName=cdec-dev'
                             }
