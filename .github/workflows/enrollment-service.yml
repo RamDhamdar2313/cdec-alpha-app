@@ -9,7 +9,7 @@
 #
 # Requires in application/backend/enrollment-service/:
 #   Dockerfile
-#   k8s/deployment.yml (with __MONGO_URI__ and __JWT_SECRET__ placeholders in env values)
+#   k8s/deployment.yml (with **IMAGE**, __MONGO_URI__, and __JWT_SECRET__ placeholders)
 
 name: enrollment-service
 
@@ -78,8 +78,13 @@ jobs:
 
       - name: Build and push Docker image
         run: |
+          set -euo pipefail
           docker build -t "${IMAGE}" .
           docker push "${IMAGE}"
+          aws ecr describe-images \
+            --repository-name backend/enrollment-service \
+            --image-ids imageTag="${IMAGE##*:}" \
+            --region "${ECR_REGION}"
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -89,14 +94,25 @@ jobs:
           MONGO_URI: ${{ secrets.MONGO_URI }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
+          set -euo pipefail
           aws eks update-kubeconfig --region "${EKS_REGION}" --name "${EKS_CLUSTER}"
 
-          MONGO_URI_ESCAPED=$(echo "${MONGO_URI}" | sed 's/&/\\&/g')
-          JWT_SECRET_ESCAPED=$(echo "${JWT_SECRET}" | sed 's/&/\\&/g')
-          sed -e "s|__MONGO_URI__|${MONGO_URI_ESCAPED}|g" \
+          MONGO_URI_ESCAPED=$(printf '%s' "${MONGO_URI}" | sed 's/[&]/\\&/g')
+          JWT_SECRET_ESCAPED=$(printf '%s' "${JWT_SECRET}" | sed 's/[&]/\\&/g')
+          sed -e "s|**IMAGE**|${IMAGE}|g" \
+              -e "s|__MONGO_URI__|${MONGO_URI_ESCAPED}|g" \
               -e "s|__JWT_SECRET__|${JWT_SECRET_ESCAPED}|g" \
               k8s/deployment.yml > k8s/deployment.generated.yml
 
+          echo "Deploying image:"
+          grep "image:" k8s/deployment.generated.yml
           kubectl apply -f k8s/deployment.generated.yml -n default
+          kubectl get deployment enrollment-service -n default -o yaml | grep image
           kubectl rollout restart deployment/enrollment-service -n default
-          kubectl rollout status deployment/enrollment-service -n default --timeout=300s
+          if ! kubectl rollout status deployment/enrollment-service -n default --timeout=300s; then
+            kubectl describe deployment enrollment-service -n default || true
+            kubectl get pods -n default -o wide || true
+            kubectl describe pods -n default -l app=enrollment-service || true
+            kubectl get events -n default --sort-by=.metadata.creationTimestamp || true
+            exit 1
+          fi
