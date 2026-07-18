@@ -75,7 +75,7 @@ pipeline {
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
                     withCredentials([
-                        string(credentialsId: 'mongo-uri-course-serivce', variable: 'BASE_MONGO_URI'),
+                        string(credentialsId: 'mongo-uri-course-service', variable: 'BASE_MONGO_URI'),
                         string(credentialsId: 'jwt-secret-course-service', variable: 'JWT_SECRET')
                     ]) {
                         dir('application/backend/course-service') {
