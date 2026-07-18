@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: enrollment-service
-          image: **IMAGE**
+          image: __IMAGE__
           imagePullPolicy: Always
           ports:
             - containerPort: 8083

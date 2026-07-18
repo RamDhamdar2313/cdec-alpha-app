@@ -99,7 +99,7 @@ jobs:
 
           MONGO_URI_ESCAPED=$(printf '%s' "${MONGO_URI}" | sed 's/[&]/\\&/g')
           JWT_SECRET_ESCAPED=$(printf '%s' "${JWT_SECRET}" | sed 's/[&]/\\&/g')
-          sed -e "s|**IMAGE**|${IMAGE}|g" \
+          sed -e "s|__IMAGE__|${IMAGE}|g" \
               -e "s|__MONGO_URI__|${MONGO_URI_ESCAPED}|g" \
               -e "s|__JWT_SECRET__|${JWT_SECRET_ESCAPED}|g" \
               k8s/deployment.yml > k8s/deployment.generated.yml
